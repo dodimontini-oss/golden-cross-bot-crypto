@@ -63,7 +63,7 @@ GRANULARITY = "1d"
 FAST_LEN = 50
 SLOW_LEN = 200
 ATR_LEN = 14
-ATR_STOP_MULT = 2.0
+ATR_STOP_MULT = 4.0  # widened from 2.0 on 2026-08-26 - walk-forward validated improvement, see crypto_bot/stop_distance_sweep_lab.py
 RR_RATIO = 2.0
 RISK_PER_TRADE_PCT = 1.0
 
