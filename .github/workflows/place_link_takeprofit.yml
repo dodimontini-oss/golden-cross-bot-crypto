@@ -1,0 +1,18 @@
+name: Place LINK Take-Profit (manual, one-off)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  place:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install requests
+      - run: python place_link_takeprofit.py
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
