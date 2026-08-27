@@ -258,8 +258,22 @@ def check_and_trade(binance_symbol: str, alpaca_symbol: str):
               binance_symbol, row["time"], row["close"], trade_qty, target)
     market_order(alpaca_symbol, trade_qty, "buy")
     time.sleep(2)  # let the market order fill before placing the limit exit
-    limit_order(alpaca_symbol, trade_qty, "sell", target)
 
+    # Use the ACTUAL filled qty, not trade_qty (the pre-fill request) - Alpaca
+    # deducts crypto trading fees IN-KIND from the asset received, so the
+    # position always ends up slightly smaller than what was requested
+    # (confirmed 2026-08-26: a 910.713814 LINK buy request settled to
+    # 908.437029464 actually held). Placing the limit sell for the original
+    # trade_qty gets rejected as insufficient balance - which check_all_pairs()
+    # silently swallows as a per-pair warning, leaving the position with NO
+    # take-profit order and no way to ever self-heal (the open-position branch
+    # above just warns and returns every cycle once this happens).
+    actual_qty, _ = get_position(alpaca_symbol)
+    if actual_qty <= 0:
+        log.warning("[%s] Buy order placed but position shows %.6f units - skipping limit exit placement this cycle.",
+                     binance_symbol, actual_qty)
+        return
+    limit_order(alpaca_symbol, actual_qty, "sell", target)
 
 def check_all_pairs():
     for binance_symbol, alpaca_symbol in PAIR_MAP.items():
