@@ -30,7 +30,7 @@ Universe deliberately stays at the original 17 large caps. Expanding to all
 147 liquid Binance.US USDT pairs was tested and made things WORSE (late-half
 walk-forward PF collapsed 3.74 -> 1.50, and uncapped concurrency pushed
 drawdown to 70%); the small-cap breakouts fail more and the backtest doesn't
-even model their worse slippage. Don't widen it.
+even model their worse slippage. Don't widen it. Further narrowed to 12 on 2026-09-01 - see the PAIR_MAP comment below for why; that drop was a data-availability fact, not a re-litigation of this finding.
 
 Three execution realities this design has to work around, all confirmed by
 direct testing against Alpaca (see live_bot.py's docstring, same account):
@@ -128,12 +128,10 @@ RISK_PER_TRADE_PCT = 2.0
 CANDLES_NEEDED = BTC_REGIME_LEN + ATR_LEN + 60  # enough for every indicator plus slack
 
 PAIR_MAP = {
-    "BTCUSDT": "BTC/USD", "ETHUSDT": "ETH/USD", "SOLUSDT": "SOL/USD",
-    "XRPUSDT": "XRP/USD", "ADAUSDT": "ADA/USD", "DOGEUSDT": "DOGE/USD",
-    "LTCUSDT": "LTC/USD", "LINKUSDT": "LINK/USD", "AVAXUSDT": "AVAX/USD",
-    "DOTUSDT": "DOT/USD", "MATICUSDT": "MATIC/USD", "BCHUSDT": "BCH/USD",
-    "UNIUSDT": "UNI/USD", "ATOMUSDT": "ATOM/USD", "ALGOUSDT": "ALGO/USD",
-    "XLMUSDT": "XLM/USD", "ETCUSDT": "ETC/USD",
+  "BTCUSDT": "BTC/USD", "ETHUSDT": "ETH/USD", "SOLUSDT": "SOL/USD",
+  "XRPUSDT": "XRP/USD", "ADAUSDT": "ADA/USD", "DOGEUSDT": "DOGE/USD",
+  "LTCUSDT": "LTC/USD", "LINKUSDT": "LINK/USD", "AVAXUSDT": "AVAX/USD",
+  "DOTUSDT": "DOT/USD", "BCHUSDT": "BCH/USD", "UNIUSDT": "UNI/USD",
 }
 
 
