@@ -125,6 +125,27 @@ def alpaca_position_symbol(alpaca_symbol: str) -> str:
     return alpaca_symbol.replace("/", "")
 
 
+def _get_with_retry(url, *, params=None, headers=None, timeout=15, attempts=3):
+    """GitHub-hosted runners intermittently fail DNS resolution (a real
+    2026-08-31 failure: 'Failed to resolve api.binance.us'). A single
+    transient blip should not cost a whole cycle - and with no resting stop
+    orders on Alpaca, a lost cycle means open positions go unchecked."""
+    last = None
+    for i in range(attempts):
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last = e
+            if i < attempts - 1:
+                wait = 2 ** i
+                log.warning("Network error on %s (attempt %d/%d): %s - retrying in %ds.",
+                            url, i + 1, attempts, e.__class__.__name__, wait)
+                time.sleep(wait)
+    raise last
+
+
 # ---------------- market data (Binance.US - matches the validated backtest) ----------------
 
 def get_recent_candles(binance_symbol: str, count: int) -> pd.DataFrame:
@@ -132,9 +153,8 @@ def get_recent_candles(binance_symbol: str, count: int) -> pd.DataFrame:
     in-progress candle as the final row; the backtest only ever saw closed
     bars, so it is dropped here rather than silently traded on."""
     url = f"{BINANCE_BASE_URL}/api/v3/klines"
-    resp = requests.get(url, params={"symbol": binance_symbol, "interval": GRANULARITY,
-                                      "limit": count + 1}, timeout=15)
-    resp.raise_for_status()
+    resp = _get_with_retry(url, params={"symbol": binance_symbol, "interval": GRANULARITY,
+                                        "limit": count + 1}, timeout=15)
     rows = [
         {"time": pd.to_datetime(r[0], unit="ms", utc=True), "open": float(r[1]), "high": float(r[2]),
          "low": float(r[3]), "close": float(r[4])}
@@ -145,9 +165,8 @@ def get_recent_candles(binance_symbol: str, count: int) -> pd.DataFrame:
 
 
 def get_live_price(binance_symbol: str) -> float:
-    resp = requests.get(f"{BINANCE_BASE_URL}/api/v3/ticker/price",
-                        params={"symbol": binance_symbol}, timeout=10)
-    resp.raise_for_status()
+    resp = _get_with_retry(f"{BINANCE_BASE_URL}/api/v3/ticker/price",
+                           params={"symbol": binance_symbol}, timeout=10)
     return float(resp.json()["price"])
 
 
@@ -181,12 +200,22 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def btc_regime_is_bullish() -> bool:
-    """BTC above its own 200-day SMA. Fetched once per cycle and reused."""
-    df = get_recent_candles("BTCUSDT", CANDLES_NEEDED)
+def btc_regime_is_bullish():
+    """BTC above its own 200-day SMA. Fetched once per cycle and reused.
+
+    Returns True/False, or None when the regime genuinely could not be
+    determined (network failure). None is NOT the same as bearish: it blocks
+    new entries but must never block exit management, which is the whole
+    reason this is separated out rather than raising."""
+    try:
+        df = get_recent_candles("BTCUSDT", CANDLES_NEEDED)
+    except Exception as e:
+        log.error("Could not fetch BTC data to judge the regime (%s) - entries disabled this cycle, "
+                  "exits still enforced.", e.__class__.__name__)
+        return None
     if len(df) < BTC_REGIME_LEN + 1:
-        log.warning("Not enough BTC history (%d bars) to judge the regime - treating as BEARISH (no new entries).", len(df))
-        return False
+        log.warning("Not enough BTC history (%d bars) to judge the regime - no new entries.", len(df))
+        return None
     sma = df["close"].rolling(BTC_REGIME_LEN).mean().iloc[-1]
     close = df["close"].iloc[-1]
     bullish = bool(close > sma)
@@ -342,7 +371,7 @@ def try_entry(binance_symbol, alpaca_symbol, df, equity, available_cash):
     market_order(alpaca_symbol, qty, "buy")
 
 
-def check_and_trade(binance_symbol, alpaca_symbol, btc_bullish, equity, available_cash):
+def check_and_trade(binance_symbol, alpaca_symbol, allow_entries, equity, available_cash):
     cancel_stale_limit_orders(alpaca_symbol)
 
     df = get_recent_candles(binance_symbol, CANDLES_NEEDED)
@@ -356,29 +385,50 @@ def check_and_trade(binance_symbol, alpaca_symbol, btc_bullish, equity, availabl
         manage_open_position(binance_symbol, alpaca_symbol, qty, avg_entry, df)
         return
 
-    if not btc_bullish:
-        log.info("[%s] Flat, but BTC regime is bearish - no new entries.", binance_symbol)
+    if not allow_entries:
+        log.info("[%s] Flat, entries not permitted this cycle. No action.", binance_symbol)
         return
 
     try_entry(binance_symbol, alpaca_symbol, df, equity, available_cash)
 
 
 def check_all_pairs():
-    account = get_account()
-    equity = float(account["equity"])
-    # Spot crypto buys settle against cash, so cash - not equity - is what
-    # actually constrains a new position once others are already open.
-    available_cash = float(account.get("non_marginable_buying_power") or account.get("cash") or 0.0)
-    log.info("Account equity $%.2f | cash available for new positions $%.2f | risk per trade %.1f%%",
-             equity, available_cash, RISK_PER_TRADE_PCT)
+    """Exits are the priority. A failure fetching the account or the BTC
+    regime disables NEW ENTRIES for this cycle but must still let every open
+    position be checked against its stop and channel exit - with no resting
+    protective orders at Alpaca, a cycle that dies early is a cycle where
+    nothing is protected. (Learned from a real 2026-08-31 run that aborted on
+    a transient DNS failure before managing any position.)"""
+    equity = available_cash = None
+    try:
+        account = get_account()
+        equity = float(account["equity"])
+        # Spot crypto buys settle against cash, so cash - not equity - is what
+        # actually constrains a new position once others are already open.
+        available_cash = float(account.get("non_marginable_buying_power") or account.get("cash") or 0.0)
+        log.info("Account equity $%.2f | cash available for new positions $%.2f | risk per trade %.1f%%",
+                 equity, available_cash, RISK_PER_TRADE_PCT)
+    except Exception as e:
+        log.error("Could not read the Alpaca account (%s) - entries disabled this cycle, "
+                  "exits still enforced.", e.__class__.__name__)
 
     btc_bullish = btc_regime_is_bullish()
+    allow_entries = (btc_bullish is True) and (equity is not None)
+    if btc_bullish is False:
+        log.info("BTC regime is bearish - no new entries this cycle.")
+    if not allow_entries:
+        log.info("Entries disabled this cycle; open positions will still be managed.")
 
     for binance_symbol, alpaca_symbol in PAIR_MAP.items():
         try:
-            check_and_trade(binance_symbol, alpaca_symbol, btc_bullish, equity, available_cash)
-            # refresh cash as positions consume it during this pass
-            available_cash = float(get_account().get("non_marginable_buying_power") or 0.0)
+            check_and_trade(binance_symbol, alpaca_symbol, allow_entries, equity, available_cash)
+            if allow_entries:
+                # refresh cash as positions consume it during this pass
+                try:
+                    available_cash = float(get_account().get("non_marginable_buying_power") or 0.0)
+                except Exception:
+                    log.warning("Could not refresh available cash - disabling further entries this cycle.")
+                    allow_entries = False
         except requests.exceptions.HTTPError as e:
             log.warning("[%s] Skipped - %s", binance_symbol, e)
         except Exception:
