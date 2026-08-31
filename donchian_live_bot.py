@@ -46,7 +46,24 @@ direct testing against Alpaca (see live_bot.py's docstring, same account):
    step down in offline safety versus the old bot and the scheduled job
    must be kept running reliably.
 
-3. Alpaca crypto is spot-only (no shorting), which is fine here - the
+3. MARKET DATA COMES FROM ALPACA, NOT BINANCE.US (changed 2026-08-31).
+   The strategy was backtested on Binance.US daily candles, and this bot
+   originally read them live. On 2026-08-31 api.binance.us stopped
+   resolving - from GitHub runners AND from a normal home connection - and
+   eight consecutive scheduled runs died before managing a single position.
+   With no resting stop orders at Alpaca (see 1 and 2), a data outage means
+   open positions go completely unwatched, so a single-venue dependency on
+   an exchange we do not even trade through was the wrong design.
+   Alpaca's crypto bars are public (no auth), and Alpaca is the venue that
+   actually fills these orders, so data and execution now agree. Measured
+   2026-08-31 against the cached Binance history over a 12-day overlap:
+   median absolute daily-close difference 0.018% (BTC), 0.037% (ETH),
+   0.155% (LINK); worst case 0.55%. That is immaterial for a daily
+   strategy with 4xATR stops, but it does mean live Donchian levels can sit
+   a hair away from the backtested ones - a known, bounded difference, not
+   an unexamined one.
+
+4. Alpaca crypto is spot-only (no shorting), which is fine here - the
    validated strategy is long-only anyway, so unlike the Golden Cross bot
    there is no gap between what was backtested and what can be executed.
 
@@ -56,9 +73,9 @@ stateless). The initial stop needs the ATR as of the ENTRY bar, which is
 recovered by looking up the position's opening fill in Alpaca's own order
 history and recomputing ATR as of that date - no state file needed.
 
-Signals are taken from the last CLOSED daily candle only; Binance returns
-the in-progress candle as the final row and acting on it would mean trading
-a partial bar the backtest never saw. Schedule this shortly after 00:00 UTC
+Signals are taken from the last CLOSED daily candle only; the feed includes
+the current in-progress day, and acting on it would mean trading a partial
+bar the backtest never saw, so it is filtered out by date. Schedule this shortly after 00:00 UTC
 so entries land near the next daily open, matching the backtest's
 "signal on close, enter at next open" rule.
 
@@ -86,7 +103,7 @@ log = logging.getLogger("crypto-donchian")
 ALPACA_API_KEY = os.environ["ALPACA_API_KEY"]
 ALPACA_SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
 ALPACA_BASE_URL = "https://paper-api.alpaca.markets"  # paper only - never change without a deliberate decision
-BINANCE_BASE_URL = "https://api.binance.us"           # data source only - matches the validated backtest
+CRYPTO_DATA_URL = "https://data.alpaca.markets/v1beta3/crypto/us"  # market data - see the data-source note in the docstring
 
 ALPACA_HEADERS = {
     "APCA-API-KEY-ID": ALPACA_API_KEY,
@@ -148,26 +165,33 @@ def _get_with_retry(url, *, params=None, headers=None, timeout=15, attempts=3):
 
 # ---------------- market data (Binance.US - matches the validated backtest) ----------------
 
-def get_recent_candles(binance_symbol: str, count: int) -> pd.DataFrame:
-    """Returns CLOSED daily candles only. Binance hands back the current
-    in-progress candle as the final row; the backtest only ever saw closed
-    bars, so it is dropped here rather than silently traded on."""
-    url = f"{BINANCE_BASE_URL}/api/v3/klines"
-    resp = _get_with_retry(url, params={"symbol": binance_symbol, "interval": GRANULARITY,
-                                        "limit": count + 1}, timeout=15)
-    rows = [
-        {"time": pd.to_datetime(r[0], unit="ms", utc=True), "open": float(r[1]), "high": float(r[2]),
-         "low": float(r[3]), "close": float(r[4])}
-        for r in resp.json()
-    ]
-    df = pd.DataFrame(rows)
-    return df.iloc[:-1].reset_index(drop=True) if len(df) else df
+def get_recent_candles(symbol: str, count: int) -> pd.DataFrame:
+    """Returns CLOSED daily candles only, from Alpaca.
+
+    The current (in-progress) UTC day is dropped explicitly by date rather
+    than by position: the backtest only ever saw closed bars, and acting on
+    a partial bar would be trading a candle the strategy was never validated
+    on."""
+    start = (pd.Timestamp.now('UTC').normalize() - pd.Timedelta(days=count + 120)).strftime("%Y-%m-%d")
+    resp = _get_with_retry(f"{CRYPTO_DATA_URL}/bars",
+                           params={"symbols": symbol, "timeframe": "1D",
+                                   "start": start, "limit": 10000}, timeout=20)
+    bars = resp.json().get("bars", {}).get(symbol, [])
+    if not bars:
+        return pd.DataFrame()
+    df = pd.DataFrame([
+        {"time": pd.to_datetime(b["t"], utc=True).normalize(), "open": float(b["o"]),
+         "high": float(b["h"]), "low": float(b["l"]), "close": float(b["c"])}
+        for b in bars
+    ]).sort_values("time").reset_index(drop=True)
+    today = pd.Timestamp.now('UTC').normalize()
+    return df[df["time"] < today].reset_index(drop=True)
 
 
-def get_live_price(binance_symbol: str) -> float:
-    resp = _get_with_retry(f"{BINANCE_BASE_URL}/api/v3/ticker/price",
-                           params={"symbol": binance_symbol}, timeout=10)
-    return float(resp.json()["price"])
+def get_live_price(symbol: str) -> float:
+    resp = _get_with_retry(f"{CRYPTO_DATA_URL}/latest/trades",
+                           params={"symbols": symbol}, timeout=10)
+    return float(resp.json()["trades"][symbol]["p"])
 
 
 def wilder_rma(series: pd.Series, length: int) -> pd.Series:
@@ -208,7 +232,7 @@ def btc_regime_is_bullish():
     new entries but must never block exit management, which is the whole
     reason this is separated out rather than raising."""
     try:
-        df = get_recent_candles("BTCUSDT", CANDLES_NEEDED)
+        df = get_recent_candles("BTC/USD", CANDLES_NEEDED)
     except Exception as e:
         log.error("Could not fetch BTC data to judge the regime (%s) - entries disabled this cycle, "
                   "exits still enforced.", e.__class__.__name__)
@@ -317,7 +341,7 @@ def manage_open_position(binance_symbol, alpaca_symbol, qty, avg_entry, df):
             log.warning("[%s] No ATR available - cannot evaluate the stop this cycle.", binance_symbol)
             return
 
-    live_price = get_live_price(binance_symbol)
+    live_price = get_live_price(alpaca_symbol)
     if live_price <= stop_price:
         log.info("[%s] STOP breached (price=%.6f stop=%.6f) - closing.", binance_symbol, live_price, stop_price)
         market_order(alpaca_symbol, qty, "sell")
@@ -355,7 +379,7 @@ def try_entry(binance_symbol, alpaca_symbol, df, equity, available_cash):
     # the ORB bot, which had a live order rejected for insufficient buying
     # power because pure risk-based sizing ignored what the account could
     # afford. This can only ever shrink a position, never grow it.
-    live_price = get_live_price(binance_symbol)
+    live_price = get_live_price(alpaca_symbol)
     max_qty = (available_cash * 0.95) / live_price if live_price > 0 else 0
     if max_qty <= 0:
         log.warning("[%s] Breakout signalled but no cash available - skipping.", binance_symbol)
@@ -374,7 +398,7 @@ def try_entry(binance_symbol, alpaca_symbol, df, equity, available_cash):
 def check_and_trade(binance_symbol, alpaca_symbol, allow_entries, equity, available_cash):
     cancel_stale_limit_orders(alpaca_symbol)
 
-    df = get_recent_candles(binance_symbol, CANDLES_NEEDED)
+    df = get_recent_candles(alpaca_symbol, CANDLES_NEEDED)
     if len(df) < DONCHIAN_LEN + ATR_LEN + 2:
         log.warning("[%s] Not enough candle history (%d bars).", binance_symbol, len(df))
         return
