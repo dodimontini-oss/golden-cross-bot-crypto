@@ -472,7 +472,7 @@ def run_live(poll_interval_seconds: int = 3600):
 if __name__ == "__main__":
     if os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch":
         from trading_core.smoke import alpaca_cancel_test
-        alpaca_cancel_test(ALPACA_BASE_URL, ALPACA_HEADERS, "BTC/USD")
+        alpaca_cancel_test(ALPACA_BASE_URL, ALPACA_HEADERS, "BTC/USD", quantity="10")
     else:
         mode = sys.argv[1] if len(sys.argv) > 1 else "live"
         if mode == "once":
