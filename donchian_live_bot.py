@@ -30,7 +30,7 @@ Universe deliberately stays at the original 17 large caps. Expanding to all
 147 liquid Binance.US USDT pairs was tested and made things WORSE (late-half
 walk-forward PF collapsed 3.74 -> 1.50, and uncapped concurrency pushed
 drawdown to 70%); the small-cap breakouts fail more and the backtest doesn't
-even model their worse slippage. Don't widen it. Further narrowed to 12 on 2026-09-01 - see the PAIR_MAP comment below for why; that drop was a data-availability fact, not a re-litigation of this finding.
+even model their worse slippage. Don't widen it.
 
 Three execution realities this design has to work around, all confirmed by
 direct testing against Alpaca (see live_bot.py's docstring, same account):
@@ -89,6 +89,11 @@ Environment variables required:
     ALPACA_SECRET_KEY
 """
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+from trading_core import execution as safety
+
 import logging
 import os
 import sys
@@ -128,10 +133,10 @@ RISK_PER_TRADE_PCT = 2.0
 CANDLES_NEEDED = BTC_REGIME_LEN + ATR_LEN + 60  # enough for every indicator plus slack
 
 PAIR_MAP = {
-  "BTCUSDT": "BTC/USD", "ETHUSDT": "ETH/USD", "SOLUSDT": "SOL/USD",
-  "XRPUSDT": "XRP/USD", "ADAUSDT": "ADA/USD", "DOGEUSDT": "DOGE/USD",
-  "LTCUSDT": "LTC/USD", "LINKUSDT": "LINK/USD", "AVAXUSDT": "AVAX/USD",
-  "DOTUSDT": "DOT/USD", "BCHUSDT": "BCH/USD", "UNIUSDT": "UNI/USD",
+    "BTCUSDT": "BTC/USD", "ETHUSDT": "ETH/USD", "SOLUSDT": "SOL/USD",
+    "XRPUSDT": "XRP/USD", "ADAUSDT": "ADA/USD", "DOGEUSDT": "DOGE/USD",
+    "LTCUSDT": "LTC/USD", "LINKUSDT": "LINK/USD", "AVAXUSDT": "AVAX/USD",
+    "DOTUSDT": "DOT/USD", "BCHUSDT": "BCH/USD", "UNIUSDT": "UNI/USD",
 }
 
 
@@ -280,81 +285,53 @@ def get_last_entry_time(alpaca_symbol: str):
 
 
 def cancel_stale_limit_orders(alpaca_symbol: str) -> int:
-    """This strategy NEVER rests a limit order - the exit has no fixed price.
-    So any open limit order on one of our symbols is a leftover take-profit
-    from the previous Golden Cross bot, and it is actively dangerous: once
-    that position closes the order is orphaned, and if a later Donchian
-    trade opens on the same symbol the stale order can suddenly become
-    fillable and sell the new position at the OLD bot's target price.
-    Cleaned up on sight."""
-    params = {"status": "open", "symbols": alpaca_symbol}
-    resp = requests.get(f"{ALPACA_BASE_URL}/v2/orders", headers=ALPACA_HEADERS, params=params, timeout=10)
-    resp.raise_for_status()
-    cancelled = 0
-    for order in resp.json():
-        if order.get("type") == "limit":
-            requests.delete(f"{ALPACA_BASE_URL}/v2/orders/{order['id']}", headers=ALPACA_HEADERS, timeout=10)
-            log.warning("[%s] Cancelled a stale resting limit order (id=%s, price=%s) left over from the "
-                        "previous strategy - this bot uses no resting orders.",
-                        alpaca_symbol, order["id"], order.get("limit_price"))
-            cancelled += 1
-    return cancelled
+    broker = safety.Alpaca(ALPACA_BASE_URL, ALPACA_HEADERS)
+    orders = broker.orders(alpaca_symbol, "open")
+    if any(o.get("type") == "limit" for o in orders):
+        raise RuntimeError("A limit order belongs to another strategy or an unmigrated position; reconcile ownership before running Donchian")
+    return 0
 
 
-def market_order(alpaca_symbol: str, qty: float, side: str) -> dict:
-    body = {"symbol": alpaca_symbol, "qty": str(round(abs(qty), 6)), "side": side,
-            "type": "market", "time_in_force": "gtc"}
-    resp = requests.post(f"{ALPACA_BASE_URL}/v2/orders", headers=ALPACA_HEADERS, json=body, timeout=15)
-    if resp.status_code >= 400:
-        log.error("[%s] Alpaca rejected the %s order (status %d): %s",
-                  alpaca_symbol, side, resp.status_code, resp.text)
-    resp.raise_for_status()
-    return resp.json()
+def market_order(alpaca_symbol: str, qty: float, side: str, client_id=None) -> dict:
+    broker = safety.Alpaca(ALPACA_BASE_URL, ALPACA_HEADERS)
+    if side == "sell":
+        return broker.close(alpaca_symbol)
+    if client_id is None:
+        raise ValueError("An entry requires a durable signal ID and original stop distance")
+    return broker.submit({"symbol":alpaca_symbol,"qty":safety.quantity(qty),"side":side,
+                          "type":"market","time_in_force":"gtc","client_order_id":client_id})
 
 
 # ---------------- per-pair logic ----------------
 
 def manage_open_position(binance_symbol, alpaca_symbol, qty, avg_entry, df):
-    """Enforces both exits. Stop is checked against the LIVE price (the
-    backtest checked it intrabar against the bar's low); the channel exit is
-    checked on the last closed candle's close, exactly as backtested. Stop
-    is evaluated first, matching the backtest's conservative assumption that
-    the stop fills first when a bar could have hit both."""
-    last = df.iloc[-1]
-
-    entry_time = get_last_entry_time(alpaca_symbol)
-    stop_price = None
-    if entry_time is not None:
-        at_entry = df[df["time"] <= entry_time]
-        if len(at_entry) and pd.notna(at_entry.iloc[-1]["atr"]):
-            stop_price = avg_entry - at_entry.iloc[-1]["atr"] * ATR_STOP_MULT
-    if stop_price is None:
-        # Fall back to the current ATR rather than running with no stop at
-        # all. Slightly different from the backtest (which fixes the stop at
-        # entry), but an unprotected position is the worse failure.
-        if pd.notna(last["atr"]):
-            stop_price = avg_entry - last["atr"] * ATR_STOP_MULT
-            log.warning("[%s] Could not recover the entry-bar ATR - using the current ATR for the stop.", binance_symbol)
-        else:
-            log.warning("[%s] No ATR available - cannot evaluate the stop this cycle.", binance_symbol)
-            return
-
-    live_price = get_live_price(alpaca_symbol)
-    if live_price <= stop_price:
-        log.info("[%s] STOP breached (price=%.6f stop=%.6f) - closing.", binance_symbol, live_price, stop_price)
+    broker = safety.Alpaca(ALPACA_BASE_URL, ALPACA_HEADERS)
+    entry = broker.latest_entry(alpaca_symbol)
+    distance = safety.order_risk(entry or {})
+    if distance is None:
+        # Legacy entry: anchor history to a fixed window BEFORE the fill day.
+        # Never use the entry day's eventual ATR or a moving current ATR.
+        if not entry or not entry.get("filled_at"):
+            raise RuntimeError("Cannot recover original crypto risk: position needs migration")
+        cutoff = pd.Timestamp(entry["filled_at"]).normalize()
+        start = cutoff - pd.Timedelta(days=CANDLES_NEEDED+120)
+        response = _get_with_retry(f"{CRYPTO_DATA_URL}/bars", params={"symbols":alpaca_symbol,
+            "timeframe":"1D","start":start.isoformat(),"end":cutoff.isoformat(),"limit":10000}, timeout=20)
+        rows = response.json().get("bars",{}).get(alpaca_symbol,[])
+        history = pd.DataFrame([{"time":pd.Timestamp(b["t"]),"high":b["h"],"low":b["l"],"close":b["c"]} for b in rows])
+        if history.empty:
+            raise RuntimeError("No history for legacy stop migration")
+        history = history[history.time < cutoff].sort_values("time")
+        if len(history) < ATR_LEN+100:
+            raise RuntimeError("Insufficient anchored history for legacy stop")
+        distance = safety.positive(atr_wilder(history,ATR_LEN).iloc[-1])*ATR_STOP_MULT
+    stop_price = safety.positive(avg_entry) - distance
+    live_price = safety.positive(get_live_price(alpaca_symbol))
+    last = None if df.empty else df.iloc[-1]
+    if live_price <= stop_price or (last is not None and pd.notna(last["exit_low"]) and last["close"] < last["exit_low"]):
         market_order(alpaca_symbol, qty, "sell")
-        return
-
-    exit_low = last["exit_low"]
-    if pd.notna(exit_low) and last["close"] < exit_low:
-        log.info("[%s] CHANNEL exit (last close=%.6f < %d-day low=%.6f) - closing.",
-                 binance_symbol, last["close"], EXIT_CHANNEL_LEN, exit_low)
-        market_order(alpaca_symbol, qty, "sell")
-        return
-
-    log.info("[%s] Holding %.6f units. price=%.6f stop=%.6f %dd-low=%.6f",
-             binance_symbol, qty, live_price, stop_price, EXIT_CHANNEL_LEN,
-             exit_low if pd.notna(exit_low) else float("nan"))
+    else:
+        log.info("[%s] Holding; fixed stop %.8f, price %.8f", alpaca_symbol, stop_price, live_price)
 
 
 def try_entry(binance_symbol, alpaca_symbol, df, equity, available_cash):
@@ -390,27 +367,41 @@ def try_entry(binance_symbol, alpaca_symbol, df, equity, available_cash):
     log.info("[%s] BREAKOUT confirmed (close=%.6f > %.6f) - buying %.6f units, initial stop %.6f, "
              "exit on a close below the %dd low.",
              binance_symbol, last["close"], trigger, qty, stop_price, EXIT_CHANNEL_LEN)
-    market_order(alpaca_symbol, qty, "buy")
+    market_order(alpaca_symbol, qty, "buy", safety.signal_id("dc", alpaca_symbol, last["time"], stop_distance))
 
 
 def check_and_trade(binance_symbol, alpaca_symbol, allow_entries, equity, available_cash):
-    cancel_stale_limit_orders(alpaca_symbol)
-
-    df = get_recent_candles(alpaca_symbol, CANDLES_NEEDED)
-    if len(df) < DONCHIAN_LEN + ATR_LEN + 2:
-        log.warning("[%s] Not enough candle history (%d bars).", binance_symbol, len(df))
-        return
-    df = add_indicators(df)
-
     qty, avg_entry = get_position(alpaca_symbol)
     if qty != 0:
+        try:
+            df = get_recent_candles(alpaca_symbol, CANDLES_NEEDED)
+            df = add_indicators(df) if not df.empty else df
+        except requests.exceptions.RequestException:
+            # Fixed-stop state and live-price management do not depend on history.
+            df = pd.DataFrame()
         manage_open_position(binance_symbol, alpaca_symbol, qty, avg_entry, df)
+        if df.empty:
+            raise RuntimeError("Stop checked, but channel history unavailable")
         return
+    cancel_stale_limit_orders(alpaca_symbol)
+    df = get_recent_candles(alpaca_symbol, CANDLES_NEEDED)
+    if len(df) < DONCHIAN_LEN + ATR_LEN + 2:
+        raise RuntimeError(f"Insufficient candle history for {alpaca_symbol}: {len(df)} bars")
+    df = add_indicators(df)
 
     if not allow_entries:
         log.info("[%s] Flat, entries not permitted this cycle. No action.", binance_symbol)
         return
 
+    broker = safety.Alpaca(ALPACA_BASE_URL, ALPACA_HEADERS)
+    if broker.orders(alpaca_symbol, "open"):
+        return
+    if df.iloc[-1]["time"] != pd.Timestamp.now(tz="UTC").normalize()-pd.Timedelta(days=1):
+        raise RuntimeError("Daily data is stale; entry disabled")
+    # A filled legacy order or a prior attempt on this daily signal also consumes it.
+    since = df.iloc[-1]["time"] + pd.Timedelta(days=1)
+    if any(o.get("side") == "buy" and pd.Timestamp(o["submitted_at"]) >= since for o in broker.orders(alpaca_symbol)):
+        return
     try_entry(binance_symbol, alpaca_symbol, df, equity, available_cash)
 
 
@@ -421,6 +412,7 @@ def check_all_pairs():
     protective orders at Alpaca, a cycle that dies early is a cycle where
     nothing is protected. (Learned from a real 2026-08-31 run that aborted on
     a transient DNS failure before managing any position.)"""
+    errors = []
     equity = available_cash = None
     try:
         account = get_account()
@@ -452,9 +444,13 @@ def check_all_pairs():
                     log.warning("Could not refresh available cash - disabling further entries this cycle.")
                     allow_entries = False
         except requests.exceptions.HTTPError as e:
+            errors.append(binance_symbol)
             log.warning("[%s] Skipped - %s", binance_symbol, e)
         except Exception:
+            errors.append(binance_symbol)
             log.exception("[%s] Error during check - skipping this pair this cycle.", binance_symbol)
+    if errors:
+        raise RuntimeError(f"Incomplete protection cycle: {errors}")
 
 
 def run_once():

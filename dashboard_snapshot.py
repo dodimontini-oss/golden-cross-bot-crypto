@@ -13,6 +13,12 @@ Environment variables required:
     ALPACA_SECRET_KEY
 """
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0,str(_Path(__file__).resolve().parents[1]))
+from trading_core.history import alpaca_orders
+from trading_core.ledger import closed_trades as reconcile_trades
+
 import json
 import os
 from datetime import datetime, timezone
@@ -43,31 +49,12 @@ def get_positions() -> list:
     return resp.json()
 
 
-def get_all_filled_orders() -> list:
-    resp = requests.get(f"{ALPACA_BASE_URL}/v2/orders", headers=HEADERS,
-                         params={"status": "all", "limit": 500, "direction": "desc"}, timeout=15)
-    resp.raise_for_status()
-    return sorted((o for o in resp.json() if o.get("filled_at")), key=lambda o: o["filled_at"])
+def get_all_filled_orders():
+    return alpaca_orders(ALPACA_BASE_URL, HEADERS)
 
 
-def pair_closed_trades(orders: list) -> list:
-    """Chronological buy->sell pairing per symbol - long-only, pyramiding=0,
-    so each symbol alternates buy/sell with no overlap."""
-    open_leg = {}  # symbol -> (qty, entry_price)
-    closed = []
-    for o in orders:
-        symbol, side = o["symbol"], o["side"]
-        qty = float(o["filled_qty"])
-        price = float(o["filled_avg_price"]) if o.get("filled_avg_price") else None
-        if price is None:
-            continue
-        if side == "buy":
-            open_leg[symbol] = (qty, price)
-        elif side == "sell" and symbol in open_leg:
-            open_qty, open_price = open_leg.pop(symbol)
-            pnl = (price - open_price) * open_qty
-            closed.append({"closed_at": o["filled_at"], "pnl": pnl, "symbol": symbol})
-    return closed
+def pair_closed_trades(orders):
+    return reconcile_trades(orders)
 
 
 def run():
@@ -101,6 +88,7 @@ def run():
         "balance": equity - total_unrealized,
         "unrealized_pl": total_unrealized,
         "realized_pl_alltime": realized_pl_alltime,
+        "realized_pl_basis": "Gross execution P&L; separate broker fees excluded",
         "open_positions": open_positions,
         "closed_trades": closed_trades,
     }

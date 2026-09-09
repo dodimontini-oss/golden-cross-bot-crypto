@@ -37,6 +37,11 @@ Environment variables required:
     ALPACA_SECRET_KEY
 """
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+from trading_core import execution as safety
+
 import logging
 import os
 import sys
@@ -172,7 +177,7 @@ def get_open_limit_order(alpaca_symbol: str):
     resp = requests.get(f"{ALPACA_BASE_URL}/v2/orders", headers=ALPACA_HEADERS, params=params, timeout=10)
     resp.raise_for_status()
     for order in resp.json():
-        if order["type"] == "limit":
+        if order["type"] == "limit" and order["side"] == "sell":
             return float(order["limit_price"]), order["id"]
     return None, None
 
@@ -186,11 +191,15 @@ def market_order(alpaca_symbol: str, qty: float, side: str) -> dict:
 
 
 def limit_order(alpaca_symbol: str, qty: float, side: str, price: float) -> dict:
-    body = {"symbol": alpaca_symbol, "qty": str(round(abs(qty), 6)), "side": side,
-            "type": "limit", "limit_price": str(round(price, 2)), "time_in_force": "gtc"}
-    resp = requests.post(f"{ALPACA_BASE_URL}/v2/orders", headers=ALPACA_HEADERS, json=body, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
+    broker=safety.Alpaca(ALPACA_BASE_URL,ALPACA_HEADERS)
+    entry=broker.latest_entry(alpaca_symbol)
+    if not entry:
+        raise RuntimeError("Missing entry identity for take-profit")
+    # Alpaca permits sub-dollar crypto limit precision beyond cents.
+    price=round(safety.positive(price), 6 if price<1 else 2)
+    return broker.submit({"symbol":alpaca_symbol,"qty":safety.quantity(qty),"side":side,
+        "type":"limit","limit_price":str(price),"time_in_force":"gtc",
+        "client_order_id":safety.signal_id("gc-tp",alpaca_symbol,entry.get("filled_at") or entry["submitted_at"])})
 
 
 def cancel_order(order_id: str):
@@ -200,89 +209,73 @@ def cancel_order(order_id: str):
 # ---------------- Core check-and-trade, per pair ----------------
 
 def check_and_trade(binance_symbol: str, alpaca_symbol: str):
+    broker = safety.Alpaca(ALPACA_BASE_URL, ALPACA_HEADERS)
     qty, avg_entry = get_position(alpaca_symbol)
-
-    if qty != 0:
-        # In a position - actively manage the stop-loss (no resting stop
-        # order exists for crypto). Target is already protected by the
-        # resting limit order placed at entry.
-        target_price, order_id = get_open_limit_order(alpaca_symbol)
-        if target_price is None:
-            log.warning("[%s] In a position but no resting limit order found - skipping stop check this cycle.", binance_symbol)
+    if qty:
+        entry = broker.latest_entry(alpaca_symbol)
+        distance = safety.order_risk(entry or {})
+        target, target_id = get_open_limit_order(alpaca_symbol)
+        if distance is None and target is not None:
+            distance = safety.positive(target-avg_entry)/RR_RATIO
+        if distance is None:
+            # Fail visibly; do not pretend the position is protected. The legacy
+            # migration manifest must supply its ORIGINAL stop before deployment.
+            import json
+            migrations = json.loads(os.environ.get("LEGACY_CRYPTO_STOPS", "{}"))
+            if alpaca_symbol not in migrations:
+                raise RuntimeError(f"Unprotected legacy {alpaca_symbol}: original stop required in LEGACY_CRYPTO_STOPS")
+            distance = safety.positive(avg_entry-float(migrations[alpaca_symbol]))
+        current = safety.positive(get_recent_candles(binance_symbol,2).iloc[-1]["close"])
+        if current <= avg_entry-distance:
+            broker.close(alpaca_symbol)
             return
-
-        stop_distance = abs(target_price - avg_entry) / RR_RATIO
-        stop_price = avg_entry - stop_distance  # long-only in practice, see module docstring
-
-        candles = get_recent_candles(binance_symbol, count=2)
-        current_price = candles.iloc[-1]["close"]
-
-        if current_price <= stop_price:
-            log.info("[%s] STOP breached (price=%.4f stop=%.4f) - closing position.",
-                      binance_symbol, current_price, stop_price)
-            cancel_order(order_id)
-            market_order(alpaca_symbol, qty, "sell")
-        else:
-            log.info("[%s] In a position, stop not breached (price=%.4f stop=%.4f). No action.",
-                      binance_symbol, current_price, stop_price)
+        if target is None and not broker.orders(alpaca_symbol,"open"):
+            # Reconcile settled balance on each run, including a previously delayed fill.
+            limit_order(alpaca_symbol, qty, "sell", avg_entry+distance*RR_RATIO)
         return
-
-    # Flat - check for a fresh crossover signal.
-    df = get_recent_candles(binance_symbol, count=SLOW_LEN + ATR_LEN + 10)
-    if len(df) < SLOW_LEN + 2:
-        log.warning("[%s] Not enough candle history yet (%d bars).", binance_symbol, len(df))
+    if broker.orders(alpaca_symbol,"open"):
         return
-    df = add_indicators(df)
-    signals = list(find_crossovers(df))
-    if not signals:
-        log.info("[%s] No fresh crossover. No action.", binance_symbol)
+    df = get_recent_candles(binance_symbol,SLOW_LEN+ATR_LEN+20)
+    today = pd.Timestamp.now(tz="UTC").normalize()
+    df = df[df.time < today].reset_index(drop=True)
+    if len(df)<SLOW_LEN+2 or df.iloc[-1].time != today-pd.Timedelta(days=1):
+        raise RuntimeError("Insufficient or stale daily data")
+    df=add_indicators(df)
+    signals=list(find_crossovers(df))
+    if not signals or signals[-1] != (len(df)-1,"LONG"):
         return
-
-    i, direction = signals[-1]
-    if i != len(df) - 1:
-        log.info("[%s] Most recent signal isn't on the latest candle - stale. No action.", binance_symbol)
+    row=df.iloc[-1]
+    if any(o.get("side")=="buy" and pd.Timestamp(o["submitted_at"])>=today for o in broker.orders(alpaca_symbol)):
         return
-
-    if direction == "SHORT":
-        log.info("[%s] SHORT signal - Alpaca crypto is spot-only, shorting isn't available. Skipped.", binance_symbol)
+    account=broker.get("/v2/account")
+    distance=safety.positive(row.atr)*ATR_STOP_MULT
+    price=safety.positive(get_recent_candles(binance_symbol,2).iloc[-1].close)
+    cash=float(account.get("non_marginable_buying_power") or 0)
+    trade_qty=min(float(account["equity"])*RISK_PER_TRADE_PCT/100/distance,max(0,cash)*.95/price)
+    if trade_qty<=0:
         return
+    broker.submit({"symbol":alpaca_symbol,"qty":safety.quantity(trade_qty),"side":"buy",
+                   "type":"market","time_in_force":"gtc",
+                   "client_order_id":safety.signal_id("gc",alpaca_symbol,row.time,distance)})
+    # The next reconciliation manages the filled balance even if the entry is delayed.
+    actual, average=get_position(alpaca_symbol)
+    if actual>0 and not broker.orders(alpaca_symbol,"open"):
+        limit_order(alpaca_symbol,actual,"sell",average+distance*RR_RATIO)
 
-    row = df.iloc[i]
-    equity = get_account_equity()
-    risk_amount = equity * RISK_PER_TRADE_PCT / 100
-    stop_distance = row["atr"] * ATR_STOP_MULT
-    trade_qty = risk_amount / stop_distance
-    target = row["close"] + stop_distance * RR_RATIO
-
-    log.info("[%s] LONG signal at %s (close=%.4f) - buying qty=%.6f, target=%.4f",
-              binance_symbol, row["time"], row["close"], trade_qty, target)
-    market_order(alpaca_symbol, trade_qty, "buy")
-    time.sleep(2)  # let the market order fill before placing the limit exit
-
-    # Use the ACTUAL filled qty, not trade_qty (the pre-fill request) - Alpaca
-    # deducts crypto trading fees IN-KIND from the asset received, so the
-    # position always ends up slightly smaller than what was requested
-    # (confirmed 2026-08-26: a 910.713814 LINK buy request settled to
-    # 908.437029464 actually held). Placing the limit sell for the original
-    # trade_qty gets rejected as insufficient balance - which check_all_pairs()
-    # silently swallows as a per-pair warning, leaving the position with NO
-    # take-profit order and no way to ever self-heal (the open-position branch
-    # above just warns and returns every cycle once this happens).
-    actual_qty, _ = get_position(alpaca_symbol)
-    if actual_qty <= 0:
-        log.warning("[%s] Buy order placed but position shows %.6f units - skipping limit exit placement this cycle.",
-                     binance_symbol, actual_qty)
-        return
-    limit_order(alpaca_symbol, actual_qty, "sell", target)
 
 def check_all_pairs():
+    errors = []
     for binance_symbol, alpaca_symbol in PAIR_MAP.items():
         try:
             check_and_trade(binance_symbol, alpaca_symbol)
         except requests.exceptions.HTTPError as e:
+            errors.append(binance_symbol)
             log.warning("[%s] Skipped - %s", binance_symbol, e)
         except Exception:
+            errors.append(binance_symbol)
             log.exception("[%s] Error during check - skipping this pair this cycle.", binance_symbol)
+    if errors:
+        raise RuntimeError(f"Incomplete protection cycle: {errors}")
 
 
 def run_once():
